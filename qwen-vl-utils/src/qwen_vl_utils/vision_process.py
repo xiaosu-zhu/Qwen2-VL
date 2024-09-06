@@ -122,56 +122,69 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR) -> torch.Tensor | l
         if video.startswith("file://"):
             video = video[7:]
 
-        video, audio, info = io.read_video(
-            video,
-            start_pts=ele.get("video_start", 0.0),
-            end_pts=ele.get("video_end", None),
-            pts_unit="sec",
-            output_format="TCHW",
-        )
+        vr = VideoReader(video)
+        video_fps = vr.get_avg_fps()
 
         assert not ("fps" in ele and "nframes" in ele), "Only accept either `fps` or `nframes`"
         if "nframes" in ele:
-            nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
+            nframes = round_by_factor(ele["nframes"], size_factor)
         else:
             fps = ele.get("fps", FPS)
-            min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
-            max_frames = floor_by_factor(ele.get("max_frames", min(FPS_MAX_FRAMES, video.size(0))), FRAME_FACTOR)
-            nframes = video.size(0) / info["video_fps"] * fps
-            nframes = min(max(nframes, min_frames), max_frames)
-            nframes = round_by_factor(nframes, FRAME_FACTOR)
-        if not (FRAME_FACTOR <= nframes and nframes <= video.size(0)):
-            raise ValueError(f"nframes should in interval [{FRAME_FACTOR}, {video.size(0)}], but got {nframes}.")
+            nframes = len(vr) / video_fps * fps
+            nframes = round_by_factor(nframes, size_factor)
+            if "min_frames" in ele:
+                min_frames = ele["min_frames"]
+                if nframes < min_frames:
+                    nframes = ceil_by_factor(min_frames, size_factor)
+            else:
+                min_frames = FPS_MIN_FRAMES
+                if nframes < min_frames:
+                    warnings.warn(f"nframes is less than DEFAULT_MIN_FRAMES {min_frames}, set to {nframes}.")
+                    nframes = ceil_by_factor(min_frames, size_factor)
+            if "max_frames" in ele:
+                max_frames = ele["max_frames"]
+                if nframes > max_frames:
+                    nframes = floor_by_factor(max_frames, size_factor)
+            else:
+                max_frames = FPS_MAX_FRAMES
+                if nframes > max_frames:
+                    warnings.warn(f"nframes is greater than DEFAULT_MAX_FRAMES {max_frames}, set to {nframes}.")
+                    nframes = floor_by_factor(max_frames, size_factor)
 
-        idx = torch.linspace(0, video.size(0) - 1, nframes).round().long()
-        height, width = video.shape[2:]
-        video = video[idx]
+        if not (size_factor <= nframes and nframes <= len(vr)):
+            raise ValueError(f"nframes should in interval [{size_factor}, {len(vr)}], but got {nframes}.")
+
+        idx = torch.linspace(0, len(vr) - 1, nframes).round().long()
+        raw_pixels = vr.get_batch(idx)
+        # [TCHW]
+        raw_pixels = raw_pixels.permute(0, 3, 1, 2)
+        height, width = raw_pixels.shape[2:]
 
         min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
         total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
-        max_pixels = max(min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR), int(min_pixels * 1.05))
+        max_pixels = max(min(VIDEO_MAX_PIXELS, total_pixels / nframes * size_factor), min_pixels * 1.05)
         max_pixels = ele.get("max_pixels", max_pixels)
         if "resized_height" in ele and "resized_width" in ele:
             resized_height, resized_width = smart_resize(
                 ele["resized_height"],
                 ele["resized_width"],
-                factor=image_factor,
+                factor=size_factor,
             )
         else:
             resized_height, resized_width = smart_resize(
                 height,
                 width,
-                factor=image_factor,
+                factor=size_factor,
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
             )
-        video = transforms.functional.resize(
-            video,
+        raw_pixels = transforms.functional.resize(
+            raw_pixels,
             [resized_height, resized_width],
             interpolation=InterpolationMode.BICUBIC,
             antialias=True,
         ).float()
-        return video
+        return raw_pixels
     else:
         assert isinstance(ele["video"], (list, tuple))
         process_info = ele.copy()
